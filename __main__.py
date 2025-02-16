@@ -1,17 +1,29 @@
-import sys
+import os
+
+from flask import app, request
 
 from ingestion_wizard import IngestionWizard
 
-if __name__ == '__main__':
 
-    if len(sys.argv) != 5:
-        raise ValueError('Expected 4 arguments: <gcp_projectid> <gcs_bucketid> <bq_datasetid> <bq_tableid>')
+@app.route('/bel_mij', methods=['POST'])
+def perform_ingestion():
 
     wiz = IngestionWizard(
-        gcp_projectid=sys.argv[3],
-        gcs_bucketid=sys.argv[4],
-        bq_datasetid=sys.argv[5],
-        bq_tableid=sys.argv[6],
-        disable_gcs=True
+        data_dir=request.args.get('data_dir'),
+        api_tz=request.args.get('api_tz'),
+        gcp_project_id=request.args.get('gcp_project_id'),
+        gcs_bucket_id=request.args.get('gcs_bucket_id'),
+        bq_dataset_id=request.args.get('bq_dataset_id'),
+        bq_table_id=request.args.get('bq_table_id')
     )
+
     wiz.run()
+
+
+if __name__ == "__main__":
+
+    app.run(
+        debug=True,
+        host='0.0.0.0',
+        port=int(os.environ.get('PORT', 8080))
+    )

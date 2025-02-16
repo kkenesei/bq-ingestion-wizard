@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import pendulum
 
@@ -11,7 +11,7 @@ from google.cloud.exceptions import NotFound
 
 
 # Declare types for the recursive dictionaries used by this class
-RecursiveDictValue = Optional[str | int | float | 'RecursiveDict' | List['RecursiveDictValue']]
+RecursiveDictValue = Union[str, int, float, 'RecursiveDict', List['RecursiveDictValue']]
 RecursiveDict = Dict[str, RecursiveDictValue]
 
 
@@ -152,7 +152,7 @@ class IngestionWizard(object):
                 # creating 10Mb+ imports that BQ might complain about
                 current_data: Optional[List[RecursiveDict]] = [json.loads(record) for record in in_file]
                 if not current_data: print(f'File {file.name} yielded no data')
-                else: all_data += [[current_data]]
+                else: all_data += [current_data]
 
         # Throw and exception if the JSON files yielded no data
         if not all_data: raise Exception('None of the JSON files yielded any data')
@@ -180,7 +180,7 @@ class IngestionWizard(object):
                     # creating 10Mb+ imports that BQ might complain about
                     current_data: Optional[List[RecursiveDict]] = [json.loads(record) for record in in_file]
                     if not current_data: print(f'File {file} yielded no data')
-                    else: all_data += [[current_data]]
+                    else: all_data += [current_data]
 
         # Throw and exception if the JSON files yielded no data
         if not all_data: raise Exception('None of the JSON files yielded any data')
@@ -200,26 +200,27 @@ class IngestionWizard(object):
             # Set the default mode of all fields
             mode: str = 'NULLABLE'
 
-            # Detect fields that are repeated and take a sample value for later type inference
-            if isinstance(value, list):
-                if len(value):
-                    value = value[0]
-                    mode = 'REPEATED'
-                # Empty lists are not suitable for type inference
-                else: continue
-
             # If a nested field is detected, go one level deeper in the recursion
-            elif isinstance(value, dict):
+            if isinstance(value, dict):
                 schema[name] = {
                     'type': 'RECORD',
                     'mode': mode,
                     'fields': self._infer_schema(value, schema.get(name, {}).get('fields', {})),
                 }
 
-            # All other new fields are simply mapped to BigQuery data types based
-            # on their Python data types. For timestamps, we utilise pendulum, as it
-            # offers a convenient method to detect common timestamp formats.
             else:
+                # Detect fields that are repeated and take a sample value for later type inference
+                if isinstance(value, list):
+                    if len(value):
+                        value = value[0]
+                        mode = 'REPEATED'
+                    # Empty lists are not suitable for type inference
+                    else: continue
+
+                # All other new fields are simply mapped to BigQuery data types based
+                # on their Python data types. For timestamps, we utilise pendulum, as it
+                # offers a convenient method to detect common timestamp formats.
+
                 # Temporary value storage that allows pendulum objects
                 temp_value: RecursiveDictValue | pendulum.DateTime = value
                 # Timestamps hide in JSON string fields
@@ -230,7 +231,7 @@ class IngestionWizard(object):
                     'type': self.bq_schema_mapping[type(temp_value)],
                     'mode': mode,
                     'fields': None
-                }
+                    }
 
         return schema
 
@@ -253,10 +254,8 @@ class IngestionWizard(object):
 
         self.schema_data = schema
 
-        # Write the inferred schema to disk in case it needs to be checked
-        schema_json: str = json.dumps(schema, indent=4)
-        with open('inferred_schema.json', 'w') as out_file:
-            out_file.write(schema_json)
+        # Write the merged schema to disk in case it needs to be checked
+        self._schema_writer_wrapper(self.schema_data, 'inferred_schema.json')
 
         print('Finished determining schema of JSON data')
 
@@ -286,18 +285,58 @@ class IngestionWizard(object):
         self.data = [[self._ts_format(record, self.schema_data) for record in file] for file in self.data]
         print('Finished formatting the timestamp values')
 
+    def _schema_writer(self, schema: RecursiveDict) -> List[RecursiveDict]:
+        """Private class method to cast a Python-native schema dictionary
+        into the BigQuery-friendly layout so that it can be written to file."""
+
+        schema_out: list = []
+        for name, value in schema.items():
+
+            # Non-nested fields
+            field: RecursiveDict = {
+                'name': name,
+                'type': value['type'],
+                'mode': value['mode']
+            }
+
+            # Recursive implementation to handle nested fields correctly
+            if value.get('fields'):
+                field['fields'] = self._schema_writer(value['fields'])
+
+            schema_out += [field]
+
+        return schema_out
+
+    def _schema_writer_wrapper(self, schema: RecursiveDict, file_name: str) -> None:
+        """Private class method to write a BigQuery-friendly version of
+        Python-native schema to file. Write to the script location when
+        GCS interactions are disabled, otherwise write to the root of
+        the GCS bucket."""
+
+        schema_json: str = json.dumps(self._schema_writer(schema), indent=4)
+
+        # Write to GCS if GCS interactions are not disabled
+        if not self.disable_gcs:
+            with self.gcs_client.bucket(self.gcs_bucket_id).blob(file_name).open("w") as out_file:
+                out_file.write(schema_json)
+
+        # Otherwise write to the script directory
+        else:
+            with open(file_name, 'w') as out_file:
+                out_file.write(schema_json)
+
     def _schema_dict_to_bq(self, schema: RecursiveDict) -> List[bigquery.SchemaField]:
         """Private class method to cast a Python-native schema dictionary
         as a list of BigQuery SchemaField objects that can be passed to the
         table directly."""
 
         return [bigquery.SchemaField(
-            name=field,
+            name=name,
             field_type=value['type'],
             mode=value['mode'],
             # Recursive implementation to handle nested fields correctly
             fields=self._schema_dict_to_bq(value.get('fields'))
-        ) for field, value in schema.items()] if schema else None
+        ) for name, value in schema.items()] if schema else None
 
     def _schema_bq_to_dict(self, schema: List[bigquery.SchemaField]) -> RecursiveDict:
         """Private class method to cast a list of BigQuery SchemaField
@@ -336,9 +375,7 @@ class IngestionWizard(object):
         self.schema_merged = self._merge_schemas(self.schema_data, self.schema_bq)
 
         # Write the merged schema to disk in case it needs to be checked
-        schema_json: str = json.dumps(self.schema_merged, indent=4)
-        with open('merged_schema.json', 'w') as out_file:
-            out_file.write(schema_json)
+        self._schema_writer_wrapper(self.schema_merged, 'merged_schema.json')
 
     def _create_table(self) -> None:
         """Private class method to create the target BigQuery table based on the
@@ -394,4 +431,4 @@ class IngestionWizard(object):
             self._stream_data_to_table()
         else: print('Skipping BigQuery operations')
 
-        print('All steps of ingestion process have completed. Cheers!')
+        print('All steps of ingestion process have completed. Graag gedaan.')

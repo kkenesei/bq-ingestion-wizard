@@ -62,14 +62,14 @@ class IngestionWizard:
 
     def __init__(
         self,
-        data_dir: Optional[str] = 'data',
-        api_tz: Optional[str] = 'Europe/Amsterdam',
+        data_dir: Optional[str] = None,
+        api_tz: Optional[str] = None,
         gcp_project_id: Optional[str] = None,
         gcs_bucket_id: Optional[str] = None,
         bq_dataset_id: Optional[str] = None,
         bq_table_id: Optional[str] = None,
-        disable_gcs: Optional[bool] = False,
-        disable_bq: Optional[bool] = False
+        disable_gcs: Optional[bool] = None,
+        disable_bq: Optional[bool] = None
     ):
 
         # Detect accidental omission of GCP arguments
@@ -81,10 +81,10 @@ class IngestionWizard:
         ):
             raise ValueError('One or more GCP arguments missing')
 
-        # Initialise the non-GCP class variables
-        self.disable_gcs, self.disable_bq = disable_gcs, disable_bq
-        self.data_dir = data_dir
-        self.api_tz = api_tz
+        # Initialise the non-GCP class variables (defaults are also applied here)
+        self.disable_gcs, self.disable_bq = disable_gcs or False, disable_bq or False
+        self.data_dir = data_dir or 'data'
+        self.api_tz = api_tz or 'Europe/Amsterdam'
         self.data: Optional[List[List[RecursiveDict]]] = None
         self.schema_data: Optional[RecursiveDict] = None
         self.schema_bq: Optional[RecursiveDict] = None

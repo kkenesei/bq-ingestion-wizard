@@ -79,7 +79,7 @@ class IngestionWizard:
         ):
             raise ValueError('One or more GCP arguments missing')
 
-        # Initialise the non-GCP class variables (defaults are also applied here)
+        # Initialise the general class variables (defaults are also applied here)
         self.disable_gcs, self.disable_bq = disable_gcs or False, disable_bq or False
         self.data_dir = data_dir or 'data'
         self.api_tz = api_tz or 'Europe/Amsterdam'
@@ -97,7 +97,7 @@ class IngestionWizard:
             pendulum.DateTime: 'TIMESTAMP'
         }
 
-        # Initialise the GCP class variables
+        # Initialise the GCP-related class variables
         self.gcp_project_id = gcp_project_id
         self.gcs_bucket_id = gcs_bucket_id
         self.bq_dataset_id = bq_dataset_id

@@ -7,7 +7,7 @@ from ingestion_wizard import IngestionWizard
 app = Flask(__name__)
 
 @app.route('/bel_mij', methods=['POST'])
-def perform_ingestion() -> bool:
+def perform_ingestion() -> str:
 
     wiz = IngestionWizard(
         data_dir = request.args.get('data_dir'),
@@ -18,7 +18,7 @@ def perform_ingestion() -> bool:
         bq_table_id = request.args.get('bq_table_id')
     )
     wiz.run()
-    return True
+    return 'Done! All the right buttons were pressed.'
 
 
 if __name__ == "__main__":

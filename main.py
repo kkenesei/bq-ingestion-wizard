@@ -1,9 +1,10 @@
 import os
 
-from flask import app, request
+from flask import Flask, request
 
 from ingestion_wizard import IngestionWizard
 
+app = Flask(__name__)
 
 @app.route('/bel_mij', methods=['POST'])
 def perform_ingestion():

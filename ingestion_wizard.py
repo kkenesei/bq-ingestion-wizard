@@ -45,12 +45,12 @@ class IngestionWizard:
         Instantiate with one of the two patterns below.
         Pattern 1 (regular operation):
             Provide all GCP arguments: gcp_project_id, gcs_bucket_id, bq_dataset_id, bq_table_id.
-            There are no defaults for these arguments. Omit disable_gcp or set it to False.
+            There are no defaults for these arguments.
         Pattern 2 (GCP operations disabled):
             Set disable_gcp or disable_bq (or both) to True. Depending on which feature set
             is disabled, one may omit some or all of the GCP arguments. Note: disabling GCS
             results in the Wizard looking for the source data and outputting the schema files
-            in a local relative folder and (also uses the data_dir and schema_dir arguments).
+            in a local relative folder (this also uses the data_dir and schema_dir arguments).
             However, there is no local alternative for the BigQuery steps; these are skipped.
         Once instantiated, invoke .run() to start the ingestion process.
 

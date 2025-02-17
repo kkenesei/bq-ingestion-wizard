@@ -15,7 +15,7 @@ RecursiveDictValue = Union[str, int, float, 'RecursiveDict', List['RecursiveDict
 RecursiveDict = Dict[str, RecursiveDictValue]
 
 
-class IngestionWizard(object):
+class IngestionWizard:
     """
     Class to hold all GCS-to-BigQuery ingestion data and functionality.
     Performs schema inference on the data and creates / updates the target
@@ -127,6 +127,7 @@ class IngestionWizard(object):
             print('Target table found in BigQuery')
             # Save the existing table schema in a class variable
             self.schema_bq = self._schema_bq_to_dict(self.table.schema)
+
         except NotFound:
             print('Target table not yet found in BigQuery')
 
@@ -154,10 +155,11 @@ class IngestionWizard(object):
                 if not current_data: print(f'File {file.name} yielded no data')
                 else: all_data += [current_data]
 
-        # Throw and exception if the JSON files yielded no data
+        # Throw an exception if the JSON files yielded no data
         if not all_data: raise Exception('None of the JSON files yielded any data')
 
         self.data = all_data
+
         print('Finished fetching JSON data from GCS')
 
     def _fetch_data_local(self) -> None:
@@ -182,10 +184,11 @@ class IngestionWizard(object):
                     if not current_data: print(f'File {file} yielded no data')
                     else: all_data += [current_data]
 
-        # Throw and exception if the JSON files yielded no data
+        # Throw an exception if the JSON files yielded no data
         if not all_data: raise Exception('None of the JSON files yielded any data')
 
         self.data = all_data
+
         print('Finished fetching JSON data from local directory')
 
     def _infer_schema(self, record: RecursiveDict, schema: RecursiveDict) -> RecursiveDict:
@@ -223,15 +226,17 @@ class IngestionWizard(object):
 
                 # Temporary value storage that allows pendulum objects
                 temp_value: RecursiveDictValue | pendulum.DateTime = value
+
                 # Timestamps hide in JSON string fields
                 if isinstance(value, str):
                     try: temp_value = pendulum.parse(temp_value)
                     except: pass
+
                 schema[name] = {
                     'type': self.bq_schema_mapping[type(temp_value)],
                     'mode': mode,
                     'fields': None
-                    }
+                }
 
         return schema
 
@@ -283,6 +288,7 @@ class IngestionWizard(object):
         recursive _ts_format method."""
 
         self.data = [[self._ts_format(record, self.schema_data) for record in file] for file in self.data]
+
         print('Finished formatting the timestamp values')
 
     def _schema_writer(self, schema: RecursiveDict) -> List[RecursiveDict]:
@@ -382,6 +388,7 @@ class IngestionWizard(object):
         schema of the data"""
 
         self.bq_client.create_table(bigquery.Table(self.full_table_id, self._schema_dict_to_bq(self.schema_data)))
+
         print('Target table has been created at {}'.format(self.full_table_id))
 
     def _extend_table_schema(self) -> None:

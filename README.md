@@ -7,7 +7,7 @@ the data into the newly-created or extended target table. The inferred schema of
 table is always written to file for future reference. All JSON data types are supported, as
 well as timestamps. JSON arrays, and any depth of object nesting are also supported.
 
-The implementation is designed to run as a cloud app in GCP cloud run, but it can also be
+The implementation is designed to run as a cloud app in GCP Cloud Run, but it can also be
 run manually in a local development environment.
 
 ## Usage

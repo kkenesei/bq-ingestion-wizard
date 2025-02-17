@@ -1,7 +1,7 @@
 # Newline-delimited JSON to BigQuery ingestion wizard
 
 Implements the IngestionWizard class which performs schema inference on newline-delimited
-JSON data and creates / extends the target a BigQuery table as appropriate. It also streams
+JSON data and creates / extends the target BigQuery table as appropriate. It also streams
 the data into the newly-created or extended target table. The inferred schema of the data and
 (if applicable) the schema resulting from merging it with the schema of an existing target
 table is always written to file for future reference. All JSON data types are supported, as

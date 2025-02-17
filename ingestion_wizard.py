@@ -24,14 +24,14 @@ class IngestionWizard:
     any depth of object nesting are also supported.
 
     Args:
-        data_dir (str): GCS (or local, relative) data directory name
-        api_tz (str): the pendulum-compatible timezone specification of the API output
+        data_dir (str, default: data): GCS (or local, relative) data directory name
+        api_tz (str, default: Europe/Amsterdam): the timezone specification of the API output
         gcp_project_id (str): GCP project ID (for both GCS and BigQuery)
         gcs_bucket_id (str): GCS bucket ID where the source data is stored
         bq_dataset_id (str): BigQuery dataset ID of the target table
         bq_table_id (str): BigQuery table ID of the target table
-        disable_gcs (bool): use this to disable GCS interactions (for debugging purposed)
-        disable_bq (bool): use this to disable BQ interactions (for debugging purposed)
+        disable_gcs (bool, default: False): use this to disable GCS interactions (when debugging)
+        disable_bq (bool, default: False): use this to disable BQ interactions (when debugging)
 
     Usage:
         Instantiate with one of the two patterns below.
@@ -44,18 +44,16 @@ class IngestionWizard:
             results in the Wizard looking for the files in a local relative folder (this
             also uses the data_dir argument). However, there is no local alternative for the
             BigQuery steps, these are simply skipped.
-        The arguments data_dir and api_tz are always optional, their default values are
-        'dummy_data' and 'Europe/Amsterdam' respectively.
         Once instantiated, invoke .run() to start the ingestion process.
-        The inferred (and merged, if present) schemas are always written to JSON
-        files in the folder where this script runs.
+        The inferred (and merged, if present) schemas are always written to file in the GCS
+        root (or script folder when GCS interactions are disabled).
 
     Example usage:
         wiz = IngestionWizard(
-            gcp_projectid='my_project',
-            gcs_bucketid='my_bucket',
-            bq_datasetid='my_dataset',
-            bq_tableid='my_table'
+            gcp_project_id='my_project',
+            gcs_bucket_id='my_bucket',
+            bq_dataset_id='my_dataset',
+            bq_table_id='my_table'
         )
         wiz.run()
     """

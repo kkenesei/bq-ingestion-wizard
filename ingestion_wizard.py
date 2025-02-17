@@ -1,5 +1,4 @@
-import json
-import os
+import os, json
 from typing import Dict, List, Optional, Union
 
 import pendulum
@@ -15,16 +14,25 @@ RecursiveDictValue = Union[str, int, float, 'RecursiveDict', List['RecursiveDict
 RecursiveDict = Dict[str, RecursiveDictValue]
 
 
+def reformat_timestamp(value: str, tz: str) -> str:
+    """Function to reformat any pendulum-compatible timestamp
+    string into the BigQuery-friendly format."""
+    return pendulum.parse(value, tz=tz).to_datetime_string()
+
+
 class IngestionWizard:
     """
     Class to hold all GCS-to-BigQuery ingestion data and functionality.
     Performs schema inference on the data and creates / updates the target
     BigQuery table as needed, as well as streams the data into the target table.
-    All JSON data types are supported, as well as timestamps. JSON arrays, and
-    any depth of object nesting are also supported.
+    The inferred schema of the data and (if applicable) the schema resulting
+    from merging it with the schema of an existing target table is always
+    written to file. All JSON data types are supported, as well as timestamps.
+    JSON arrays, and any depth of object nesting are also supported.
 
     Args:
-        data_dir (str, default: data): GCS (or local, relative) data directory name
+        data_dir (str, default: data): GCS (or local, relative) data input directory name
+        schema_dir (str, default: data): GCS (or local, relative) schema output directory name
         api_tz (str, default: Europe/Amsterdam): the timezone specification of the API output
         gcp_project_id (str): GCP project ID (for both GCS and BigQuery)
         gcs_bucket_id (str): GCS bucket ID where the source data is stored
@@ -41,12 +49,10 @@ class IngestionWizard:
         Pattern 2 (GCP operations disabled):
             Set disable_gcp or disable_bq (or both) to True. Depending on which feature set
             is disabled, one may omit some or all of the GCP arguments. Note: disabling GCS
-            results in the Wizard looking for the files in a local relative folder (this
-            also uses the data_dir argument). However, there is no local alternative for the
-            BigQuery steps, these are simply skipped.
+            results in the Wizard looking for the source data and outputting the schema files
+            in a local relative folder and (also uses the data_dir and schema_dir arguments).
+            However, there is no local alternative for the BigQuery steps; these are skipped.
         Once instantiated, invoke .run() to start the ingestion process.
-        The inferred (and merged, if present) schemas are always written to file in the GCS
-        root (or script folder when GCS interactions are disabled).
 
     Example usage:
         wiz = IngestionWizard(
@@ -61,6 +67,7 @@ class IngestionWizard:
     def __init__(
         self,
         data_dir: Optional[str] = None,
+        schema_dir: Optional[str] = None,
         api_tz: Optional[str] = None,
         gcp_project_id: Optional[str] = None,
         gcs_bucket_id: Optional[str] = None,
@@ -71,17 +78,16 @@ class IngestionWizard:
     ):
 
         # Detect accidental omission of GCP arguments
-        if (
-            (not disable_gcs and not (gcp_project_id and gcs_bucket_id))
-            or (not disable_bq and not (gcp_project_id and bq_dataset_id and bq_table_id))
-            or (not (disable_gcs and disable_bq) and not
-                (gcp_project_id and gcs_bucket_id and bq_dataset_id and bq_table_id))
-        ):
-            raise ValueError('One or more GCP arguments missing')
+        if not ((disable_gcs and disable_bq) or isinstance(gcp_project_id, str)):
+            raise ValueError('Please provide GCP project ID or turn off all GCP interactions')
+        if not (disable_gcs or isinstance(gcs_bucket_id, str)):
+            raise ValueError('Please provide GCS bucket ID or disable GCS interactions')
+        if not (disable_bq or (isinstance(bq_dataset_id, str) and isinstance(bq_table_id, str))):
+            raise ValueError('Please the BQ parameters or disable BQ interactions')
 
         # Initialise the general class variables (defaults are also applied here)
         self.disable_gcs, self.disable_bq = disable_gcs or False, disable_bq or False
-        self.data_dir = data_dir or 'data'
+        self.data_dir, self.schema_dir = data_dir or 'data', schema_dir or 'schemas'
         self.api_tz = api_tz or 'Europe/Amsterdam'
         self.data: Optional[List[List[RecursiveDict]]] = None
         self.schema_data: Optional[RecursiveDict] = None
@@ -108,28 +114,37 @@ class IngestionWizard:
         # Initialise the GCP clients
         self.gcs_client: Optional[storage.Client] = None
         self.bq_client: Optional[bigquery.Client] = None
-        if not disable_gcs: self.gcs_client = storage.Client(self.gcp_project_id)
-        if not disable_bq: self.bq_client = bigquery.Client(self.gcp_project_id)
+
+
+    def _init_clients(self):
+        """Private class method to initialise the GCP clients."""
+
+        if not self.disable_gcs: self.gcs_client = storage.Client(self.gcp_project_id)
+        if not self.disable_bq: self.bq_client = bigquery.Client(self.gcp_project_id)
+
 
     def _init_table(self) -> None:
         """Private class method to fetch the target table's metadata from
         BigQuery and in doing so also establish whether the table already exists
         (no dedicated method in SDK to check existence of table)."""
 
-        # Assemble the full table path / id
-        self.full_table_id = f'{self.gcp_project_id}.{self.bq_dataset_id}.{self.bq_table_id}'
+        if not self.disable_bq:
 
-        # Try pulling the metadata of the table
-        try:
-            self.table = self.bq_client.get_table(self.full_table_id)
-            print('Target table found in BigQuery')
-            # Save the existing table schema in a class variable
-            self.schema_bq = self._schema_bq_to_dict(self.table.schema)
+            # Assemble the full table path / id
+            self.full_table_id = f'{self.gcp_project_id}.{self.bq_dataset_id}.{self.bq_table_id}'
 
-        except NotFound:
-            print('Target table not yet found in BigQuery')
+            # Try pulling the metadata of the table
+            try:
+                self.table = self.bq_client.get_table(self.full_table_id)
+                print('Target table found in BigQuery')
+                # Save the existing table schema in a class variable
+                self.schema_bq = self._schema_bq_to_dict(self.table.schema)
 
-    def _fetch_data(self) -> None:
+            except NotFound:
+                print('Target table not yet found in BigQuery')
+
+
+    def _fetch_data_gcs(self) -> None:
         """Private class method to fetch data from GCS that simulates the output of
         an API ingestion process. Reads all JSON files found in the data directory
         of the source GCS bucket."""
@@ -160,6 +175,7 @@ class IngestionWizard:
 
         print('Finished fetching JSON data from GCS')
 
+
     def _fetch_data_local(self) -> None:
         """Private class method to fetch data that simulates the output of an
         API ingestion process from a local directory. Reads all JSON files found
@@ -189,43 +205,64 @@ class IngestionWizard:
 
         print('Finished fetching JSON data from local directory')
 
+
+    def _fetch_data(self) -> None:
+        """Private class method to decide whether to invoke the local or
+        the GCS fetch data method."""
+
+        if not self.disable_gcs: self._fetch_data_gcs()
+        else: self._fetch_data_local()
+
+
     def _infer_schema(self, record: RecursiveDict, schema: RecursiveDict) -> RecursiveDict:
         """Private class method to infer the schema of the data. The recursive
         implementation ensures that nested fields are processed correctly."""
 
         for name, value in record.items():
 
-            # Field already in schema? Skip.
-            if name in schema and not isinstance(value, dict): continue
+            # Empty list: skip because it is unsuitable for type inference
+            if isinstance(value, list) and not len(value): continue
 
-            # Set the default mode of all fields
-            mode: str = 'NULLABLE'
+            # Non-dict field already in schema: skip, we do not need to check again
+            field_schema = schema.get(name)
+            if field_schema:
+                if field_schema['type'] != 'RECORD': continue
 
-            # If a nested field is detected, go one level deeper in the recursion
+            # If a nested field is encountered, go one level deeper in the recursion
             if isinstance(value, dict):
                 schema[name] = {
                     'type': 'RECORD',
-                    'mode': mode,
+                    'mode': 'NULLABLE',
                     'fields': self._infer_schema(value, schema.get(name, {}).get('fields', {})),
                 }
 
-            else:
-                # Detect fields that are repeated and take a sample value for later type inference
-                if isinstance(value, list):
-                    if len(value):
-                        value = value[0]
-                        mode = 'REPEATED'
-                    # Empty lists are not suitable for type inference
-                    else: continue
+            # If a nested-repeated field is detected, go one level deeper in the recursion
+            # for each instance of the nested field and add any newly-discovered fields
+            elif isinstance(value, list) and isinstance(value[0], dict):
+                fields = schema.get(name, {}).get('fields', {})
+                for item in value:
+                    fields = fields | self._infer_schema(item, schema.get(name, {}).get('fields', {}))
+                schema[name] = {
+                    'type': 'RECORD',
+                    'mode': 'REPEATED',
+                    'fields': fields
+                }
 
-                # All other new fields are simply mapped to BigQuery data types based
-                # on their Python data types. For timestamps, we utilise pendulum, as it
-                # offers a convenient method to detect common timestamp formats.
+            # Leaf node fields are simply mapped to BigQuery data types based on their
+            # Python data types. For timestamps, we utilise pendulum, as it offers a
+            # convenient method to detect common timestamp formats.
+            else:
+
+                mode: str = 'NULLABLE'
+                # Detect fields that are repeated and take a sample value for type inference
+                if isinstance(value, list):
+                    value = value[0]
+                    mode = 'REPEATED'
 
                 # Temporary value storage that allows pendulum objects
                 temp_value: RecursiveDictValue | pendulum.DateTime = value
 
-                # Timestamps hide in JSON string fields
+                # Timestamps are "hidden" in JSON string fields
                 if isinstance(value, str):
                     try: temp_value = pendulum.parse(temp_value)
                     except: pass
@@ -237,6 +274,7 @@ class IngestionWizard:
                 }
 
         return schema
+
 
     def _infer_schema_wrapper(self) -> None:
         """Private class method to determine the schema based on the data.
@@ -262,32 +300,6 @@ class IngestionWizard:
 
         print('Finished determining schema of JSON data')
 
-    def _ts_format(self, record: RecursiveDict, schema: RecursiveDict) -> RecursiveDict:
-        """Private class method to format the timestamp values in the data
-        in the way that BigQuery expects them. Recursion also necessary here
-        to handle timestamps embedded in nested fields."""
-
-        for name, value in record.items():
-
-            # Arrived at nested field: go one level deeper in the recursion
-            if schema[name]['type'] == 'RECORD':
-                record[name] = self._ts_format(value, schema[name]['fields'])
-
-            # Timestamp encountered: overwrite value with reformatted timestamp.
-            # Parser is timezone-aware (assume API uses specific timezone)
-            elif schema[name]['type'] == 'TIMESTAMP':
-                record[name] = pendulum.parse(value, tz=self.api_tz).to_datetime_string()
-
-        return record
-
-    def _ts_format_wrapper(self) -> None:
-        """Private class method to format the timestamp values in the data
-        in the way that BigQuery expects them. This is a wrapper for the
-        recursive _ts_format method."""
-
-        self.data = [[self._ts_format(record, self.schema_data) for record in file] for file in self.data]
-
-        print('Finished formatting the timestamp values')
 
     def _schema_writer(self, schema: RecursiveDict) -> List[RecursiveDict]:
         """Private class method to cast a Python-native schema dictionary
@@ -311,23 +323,61 @@ class IngestionWizard:
 
         return schema_out
 
-    def _schema_writer_wrapper(self, schema: RecursiveDict, file_name: str) -> None:
-        """Private class method to write a BigQuery-friendly version of
-        Python-native schema to file. Write to the script location when
-        GCS interactions are disabled, otherwise write to the root of
-        the GCS bucket."""
 
+    def _schema_writer_wrapper(self, schema: RecursiveDict, filename: str) -> None:
+        """Private class method to write a BigQuery-friendly version of
+        a Python-native schema to file. Write to local directory when
+        GCS interactions are disabled, otherwise write to GCS."""
+
+        path: str = f'{self.schema_dir}/{filename}'
         schema_json: str = json.dumps(self._schema_writer(schema), indent=4)
 
         # Write to GCS if GCS interactions are not disabled
         if not self.disable_gcs:
-            with self.gcs_client.bucket(self.gcs_bucket_id).blob(file_name).open("w") as out_file:
+            with self.gcs_client.bucket(self.gcs_bucket_id).blob(path).open('w') as out_file:
                 out_file.write(schema_json)
 
-        # Otherwise write to the script directory
+        # Otherwise write to local directory
         else:
-            with open(file_name, 'w') as out_file:
+            os.makedirs(self.schema_dir, exist_ok=True)
+            with open(path, 'w') as out_file:
                 out_file.write(schema_json)
+
+
+    def _ts_format(self, record: RecursiveDict, schema: RecursiveDict) -> RecursiveDict:
+        """Private class method to format the timestamp values in the data
+        in the way that BigQuery expects them. Recursion also necessary here
+        to handle timestamps embedded in nested fields."""
+
+        for name, value in record.items():
+
+            # Arrived at nested field: go one level deeper in the recursion
+            if schema[name]['type'] == 'RECORD':
+                if schema[name]['mode'] == 'REPEATED':
+                    record[name] = [self._ts_format(item, schema[name]['fields']) for item in value]
+                else:
+                    record[name] = self._ts_format(value, schema[name]['fields'])
+
+            # Timestamp encountered: overwrite value with reformatted timestamp.
+            # Parser is timezone-aware (assume API uses specific timezone)
+            elif schema[name]['type'] == 'TIMESTAMP':
+                if schema[name]['mode'] == 'REPEATED':
+                    record[name] = [reformat_timestamp(item, self.api_tz) for item in value]
+                else:
+                    record[name] = reformat_timestamp(value, self.api_tz)
+
+        return record
+
+
+    def _ts_format_wrapper(self) -> None:
+        """Private class method to format the timestamp values in the data
+        in the way that BigQuery expects them. This is a wrapper for the
+        recursive _ts_format method."""
+
+        self.data = [[self._ts_format(record, self.schema_data) for record in file] for file in self.data]
+
+        print('Finished formatting the timestamp values')
+
 
     def _schema_dict_to_bq(self, schema: RecursiveDict) -> List[bigquery.SchemaField]:
         """Private class method to cast a Python-native schema dictionary
@@ -342,6 +392,7 @@ class IngestionWizard:
             fields=self._schema_dict_to_bq(value.get('fields'))
         ) for name, value in schema.items()] if schema else None
 
+
     def _schema_bq_to_dict(self, schema: List[bigquery.SchemaField]) -> RecursiveDict:
         """Private class method to cast a list of BigQuery SchemaField
         objects to a Python-native schema dictionary so that it can be
@@ -353,6 +404,7 @@ class IngestionWizard:
             # Recursive implementation to handle nested fields correctly
             'fields': self._schema_bq_to_dict(field.fields)
         } for field in schema} if schema else None
+
 
     def _merge_schemas(self, schema_data: RecursiveDict, schema_bq: RecursiveDict) -> RecursiveDict:
         """Private class method to merge two Python-native schema dictionaries.
@@ -372,6 +424,7 @@ class IngestionWizard:
 
         return merged
 
+
     def _merge_schemas_wrapper(self) -> None:
         """Private class method to merge two Python-native schema dictionaries.
         This is a wrapper for the recursive _merge_schemas method."""
@@ -381,6 +434,7 @@ class IngestionWizard:
         # Write the merged schema to disk in case it needs to be checked
         self._schema_writer_wrapper(self.schema_merged, 'merged_schema.json')
 
+
     def _create_table(self) -> None:
         """Private class method to create the target BigQuery table based on the
         schema of the data"""
@@ -388,6 +442,7 @@ class IngestionWizard:
         self.bq_client.create_table(bigquery.Table(self.full_table_id, self._schema_dict_to_bq(self.schema_data)))
 
         print('Target table has been created at {}'.format(self.full_table_id))
+
 
     def _extend_table_schema(self) -> None:
         """Private class method to extend the schema of the target BigQuery table
@@ -402,38 +457,46 @@ class IngestionWizard:
 
         else: print('Schemas of data and target table already match')
 
+
+    def _create_or_extend_table(self) -> None:
+        """Private class method to decide whether to create a new BigQuery table
+        or to extend an existing one."""
+
+        if not self.disable_bq:
+
+            if self.table: self._extend_table_schema()
+            else: self._create_table()
+
+
     def _stream_data_to_table(self) -> None:
         """Private class method to stream the data to the target BigQuery table.
         This step concludes the ingestion process."""
 
-        for file in self.data:
-            # No error is raised when it is the insertion of individual rows
-            # that fails, not the BQ job as a whole. The errors are accumulated
-            # in a list, and we raise an error manually if it is not empty.
-            errors = self.bq_client.insert_rows_json(self.full_table_id, file)
-            if errors: raise Exception('Error(s) occurred while inserting rows:\n{}'.format(errors))
+        if not self.disable_bq:
 
-        print('Finished streaming data to target table')
+            for file in self.data:
+                # No error is raised when it is the insertion of individual rows
+                # that fails, not the BQ job as a whole. The errors are accumulated
+                # in a list, and we raise an error manually if it is not empty.
+                errors = self.bq_client.insert_rows_json(self.full_table_id, file)
+                if errors: raise Exception('Error(s) occurred while inserting rows:\n{}'.format(errors))
+
+            print('Finished streaming data to target table')
+
 
     def run(self) -> None:
         """Public orchestrator function to execute the ingestion process.
-        Invoke this method after instantiating the class to perform ingestion.
-        When GCS interactions are disabled, the data is imported from a
-        local directory and no BigQuery interactions are performed.
-        When BQ interactions are disabled, the BigQuery steps are skipped."""
+        Invoke this method after instantiating the class to perform ingestion."""
 
-        if not self.disable_gcs: self._fetch_data()
-        else: self._fetch_data_local()
+        if self.disable_gcs: print('Skipping all GCS interactions; using local data.')
+        if self.disable_bq: print('Skipping all BQ operations.')
 
-        if not self.disable_bq: self._init_table()
-
+        self._init_clients()
+        self._fetch_data()
+        self._init_table()
         self._infer_schema_wrapper()
         self._ts_format_wrapper()
-
-        if not self.disable_bq:
-            if self.table: self._extend_table_schema()
-            else: self._create_table()
-            self._stream_data_to_table()
-        else: print('Skipping BigQuery operations')
+        self._create_or_extend_table()
+        self._stream_data_to_table()
 
         print('All steps of ingestion process have completed. Graag gedaan.')

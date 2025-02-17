@@ -1,9 +1,0 @@
-{"ts":"2020-06-18T10:44:12","started":{"pid":12345}}
-{"ts":"2020-06-18T10:44:13","logged_in":{"username":"foo","birthday":"1996-04-10"}}
-{"ts":"2020-06-18T10:44:13","session_ids":[123, 456]}
-{"ts":"2020-06-18T10:44:12","started":{"pid":23456,"session_start":"2020-06-18T10:42:45+0200"}}
-{"ts":"2020-06-18T10:44:13","logged_in":{"username":"bar"}}
-{"ts":"2020-06-18T10:44:13","session_ids":[234, 567]}
-{"ts":"2020-06-18T10:44:12","started":{"pid":34567},"logged_in":{"username":"spam","password":"eggs"}}
-{"ts":"2020-06-18T10:44:13","logged_in":{"username":"hello","password":"world"},"session_ids":[345, 678]}
-{"ts":"2020-06-18T10:44:13","started":{"pid":45678,"session_start":"2020-06-18T10:43:28+0200"},"logged_in":{"username":"admin"},"session_ids":[456, 789]}

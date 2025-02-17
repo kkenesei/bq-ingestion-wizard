@@ -16,7 +16,7 @@ RecursiveDict = Dict[str, RecursiveDictValue]
 
 def reformat_timestamp(value: str, tz: str) -> str:
     """Function to reformat any pendulum-compatible timestamp
-    string into the BigQuery-friendly format."""
+    string into a BigQuery-friendly format."""
     return pendulum.parse(value, tz=tz).to_datetime_string()
 
 

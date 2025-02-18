@@ -7,7 +7,7 @@ from ingestion_wizard import IngestionWizard
 app = Flask(__name__)
 
 @app.route('/bel_mij', methods=['POST'])
-def perform_ingestion() -> str:
+def call_the_wizard() -> str:
 
     wiz = IngestionWizard(
         data_dir=request.args.get('data_dir'),

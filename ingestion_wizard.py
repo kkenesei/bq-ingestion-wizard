@@ -190,13 +190,12 @@ class IngestionWizard:
         # Read the local data that simulates the output of an ingestion run
         all_data: Optional[List[List[RecursiveDict]]] = []
         for file in os.listdir(self.data_dir):
-            if file.endswith('.json'):
-                with open(f'{self.data_dir}/{file}') as in_file:
-                    # Keep the files separated in the list to avoid accidentally
-                    # creating 10Mb+ imports that BQ might complain about
-                    current_data: Optional[List[RecursiveDict]] = [json.loads(record) for record in in_file]
-                    if not current_data: print(f'File {file} yielded no data')
-                    else: all_data += [current_data]
+            with open(f'{self.data_dir}/{file}') as in_file:
+                # Keep the files separated in the list to avoid accidentally
+                # creating 10Mb+ imports that BQ might complain about
+                current_data: Optional[List[RecursiveDict]] = [json.loads(record) for record in in_file]
+                if not current_data: print(f'File {file} yielded no data')
+                else: all_data += [current_data]
 
         # Throw an exception if the JSON files yielded no data
         if not all_data: raise Exception('None of the JSON files yielded any data')
@@ -220,8 +219,8 @@ class IngestionWizard:
 
         for name, value in record.items():
 
-            # Empty list: skip because it is unsuitable for type inference
-            if isinstance(value, list) and not len(value): continue
+            # Missing value or empty list: skip, unsuitable for type inference
+            if not value or (isinstance(value, list) and not len(value)): continue
 
             # Non-dict field already in schema: skip, we do not need to check again
             field_schema = schema.get(name)
@@ -351,8 +350,10 @@ class IngestionWizard:
 
         for name, value in record.items():
 
+            if not value or (isinstance(value, list) and not len(value)): continue
+
             # Arrived at nested field: go one level deeper in the recursion
-            if schema[name]['type'] == 'RECORD':
+            elif schema[name]['type'] == 'RECORD':
                 if schema[name]['mode'] == 'REPEATED':
                     record[name] = [self._ts_format(item, schema[name]['fields']) for item in value]
                 else:

@@ -2,6 +2,7 @@ import os, json
 from typing import Dict, List, Optional, Union
 
 import pendulum
+import ray
 
 from google.api_core.page_iterator import HTTPIterator
 from google.cloud import bigquery
@@ -19,6 +20,51 @@ def reformat_timestamp(value: str, tz: str) -> str:
     string into a BigQuery-friendly format."""
 
     return pendulum.parse(value, tz=tz).to_datetime_string()
+
+
+def schema_dict_to_bq(schema: RecursiveDict) -> List[bigquery.SchemaField]:
+    """Casts a Python-native schema dictionary as a list of BigQuery
+    SchemaField objects that can be passed to a table directly."""
+
+    return [bigquery.SchemaField(
+        name=name,
+        field_type=value['type'],
+        mode=value['mode'],
+        # Recursive implementation to handle nested fields correctly
+        fields=schema_dict_to_bq(value.get('fields'))
+    ) for name, value in schema.items()] if schema else None
+
+
+def schema_bq_to_dict(schema: List[bigquery.SchemaField]) -> RecursiveDict:
+    """Casts a list of BigQuery SchemaField objects to a Python-native
+    schema dictionary so that it can be worked with easier."""
+
+    return {field.name: {
+        'type': field.field_type,
+        'mode': field.mode,
+        # Recursive implementation to handle nested fields correctly
+        'fields': schema_bq_to_dict(field.fields)
+    } for field in schema} if schema else None
+
+
+def merge_schemas(schema_0: RecursiveDict, schema_1: RecursiveDict) -> RecursiveDict:
+    """Merges two Python-native schema dictionaries. The recursive
+    implementation ensures that the schemas of nested fields are
+    also extended properly. schema_0 is assumed to be the status
+    quo, with schema_1 potentially containing new schema elements."""
+
+    # The merge operation of leaf nodes is just a dictionary union
+    merged: RecursiveDict = schema_1 | schema_0
+
+    # Check for any repeated records in the second schema
+    for field, config in schema_1.items():
+        # If this field is not known yet, no action is needed.
+        # If they both have the repeated record, we need recursion
+        # to check for any new nested fields
+        if config.get('fields') and schema_0.get(field):
+            merged[field]['fields'] = merge_schemas(schema_0[field]['fields'], config['fields'])
+
+    return merged
 
 
 class IngestionWizard:
@@ -111,36 +157,6 @@ class IngestionWizard:
         self.bq_table_id = bq_table_id
         self.full_table_id: Optional[str] = None
         self.table: Optional[bigquery.table.Table] = None
-        self.gcs_client: Optional[storage.Client] = None
-        self.bq_client: Optional[bigquery.Client] = None
-
-
-    def _init_clients(self) -> None:
-        """Private class method to initialise the GCP clients."""
-
-        if not self.disable_gcs: self.gcs_client = storage.Client(self.gcp_project_id)
-        if not self.disable_bq: self.bq_client = bigquery.Client(self.gcp_project_id)
-
-
-    def _init_table(self) -> None:
-        """Private class method to fetch the target table's metadata from
-        BigQuery and in doing so also establish whether the table already exists
-        (no dedicated method in SDK to check existence of table)."""
-
-        if not self.disable_bq:
-
-            # Assemble the full table path / id
-            self.full_table_id = f'{self.gcp_project_id}.{self.bq_dataset_id}.{self.bq_table_id}'
-
-            # Try pulling the metadata of the table
-            try:
-                self.table = self.bq_client.get_table(self.full_table_id)
-                print('Target table found in BigQuery')
-                # Save the existing table schema in a class variable
-                self.schema_bq = self._schema_bq_to_dict(self.table.schema)
-
-            except NotFound:
-                print('Target table not yet found in BigQuery')
 
 
     def _fetch_data_gcs(self) -> None:
@@ -148,29 +164,30 @@ class IngestionWizard:
         an API ingestion process. Reads all JSON files found in the data directory
         of the source GCS bucket."""
 
+        gcs_client = storage.Client(self.gcp_project_id)
+
         # List all files in the bucket
-        blobs: HTTPIterator = self.gcs_client.list_blobs(self.gcs_bucket_id)
+        blobs: HTTPIterator = gcs_client.list_blobs(self.gcs_bucket_id)
         files: Optional[List[storage.blob.Blob]] = \
             [b for b in blobs if b.name.startswith(self.data_dir) and b.name.endswith('.json')]
 
         # Throw an exception if no files were found in the expected place
         if not files: raise FileNotFoundError('No JSON files found in GCS')
 
-        # Read the GCS data that simulates the output of an ingestion run
-        # by filtering on the expected path and file type
-        all_data: Optional[List[List[RecursiveDict]]] = []
+        # Download and import the GCS data. Note: unlike in the local imports
+        # (below) we cannot use parallelism here. The only plausible way around
+        # that the GCP clients cannot be pickled would be to instantiate a set
+        # number of Ray Actors, each with its own GCP client. This is beyond the
+        # scope of this project (and it quite possible would not work either).
+        data: Optional[List[List[RecursiveDict]]] = []
         for file in files:
             with file.open('r') as in_file:
-                # Keep the files separated in the list to avoid accidentally
-                # creating 10Mb+ imports that BQ might complain about
-                current_data: Optional[List[RecursiveDict]] = [json.loads(record) for record in in_file]
-                if not current_data: print(f'File {file.name} yielded no data')
-                else: all_data += [current_data]
+                data += [[json.loads(record) for record in in_file]]
 
         # Throw an exception if the JSON files yielded no data
-        if not all_data: raise Exception('None of the JSON files yielded any data')
+        if not data: raise Exception('None of the JSON files yielded any data')
 
-        self.data = all_data
+        self.data = data
 
         print('Finished fetching JSON data from GCS')
 
@@ -181,25 +198,25 @@ class IngestionWizard:
         in the data directory of the local file system (relative file path)."""
 
         # List all files in the local directory
-        files: List[str] = [file for file in os.listdir(self.data_dir) if file.endswith('.json')]
+        files: List[str] = [file for file in os.listdir(self.data_dir)]
 
         # Throw an exception if no files were found in the expected place
         if not files: raise FileNotFoundError('No JSON files found in the local directory')
 
-        # Read the local data that simulates the output of an ingestion run
-        all_data: Optional[List[List[RecursiveDict]]] = []
-        for file in os.listdir(self.data_dir):
+        # Use Ray parallelism to import local data files. This offers
+        # runtime benefits only when a large volume of data is read.
+        @ray.remote
+        def file_import_local(file: str) -> List[RecursiveDict]:
+
+            # Import the data from a local file
             with open(f'{self.data_dir}/{file}') as in_file:
-                # Keep the files separated in the list to avoid accidentally
-                # creating 10Mb+ imports that BQ might complain about
-                current_data: Optional[List[RecursiveDict]] = [json.loads(record) for record in in_file]
-                if not current_data: print(f'File {file} yielded no data')
-                else: all_data += [current_data]
+                return [json.loads(record) for record in in_file]
+
+        # Launch the Ray workers and wait for them all to return
+        self.data = ray.get([file_import_local.remote(self.data_dir, file) for file in files])
 
         # Throw an exception if the JSON files yielded no data
-        if not all_data: raise Exception('None of the JSON files yielded any data')
-
-        self.data = all_data
+        if not self.data: raise Exception('None of the JSON files yielded any data')
 
         print('Finished fetching JSON data from local directory')
 
@@ -219,7 +236,7 @@ class IngestionWizard:
         for name, value in record.items():
 
             # Missing value or empty list: skip, unsuitable for type inference
-            if not value or (isinstance(value, list) and not len(value)): continue
+            if value is None or (isinstance(value, list) and not len(value)): continue
 
             # Non-dict field already in schema: skip, we do not need to check again
             field_schema = schema.get(name)
@@ -287,11 +304,29 @@ class IngestionWizard:
             }
         }
 
-        # Detect schema extensions (starting with just ts) record by record
-        for record in [record for file in self.data for record in file]:
-            schema = self._infer_schema(record, schema)
+        # Use Ray parallelism to perform the processing-heavy iteration
+        @ray.remote
+        def schema_inference_distributable(file: List[RecursiveDict]) -> RecursiveDict:
 
-        self.schema_data = schema
+            # Detect schema extensions (starting with just ts) record by record
+            schema: RecursiveDict = {}
+            for record in file:
+                schema = self._infer_schema(record, schema)
+
+            return schema
+
+        # Launch the Ray workers and wait for them all to return
+        schemas = ray.get([schema_inference_distributable.remote(file) for file in self.data])
+
+        # Each worker returns a schema specific to the part of the data it looked
+        # at. Merging the schemas yields the global schema. This does not represent
+        # a bottleneck because each schema is just a tiny dictionary, their size is,
+        # the multiprocessing gain per file far exceeds the overhead of a single merge.
+        merged_schemas = {}
+        for schema in schemas:
+            merged_schemas = merge_schemas(schema, merged_schemas)
+
+        self.schema_data = merged_schemas
 
         # Write the merged schema to disk in case it needs to be checked
         self._schema_writer_wrapper(self.schema_data, 'inferred_schema.json')
@@ -332,11 +367,15 @@ class IngestionWizard:
 
         # Write to GCS if GCS interactions are not disabled
         if not self.disable_gcs:
-            with self.gcs_client.bucket(self.gcs_bucket_id).blob(path).open('w') as out_file:
+
+            gcs_client = storage.Client(self.gcp_project_id)
+
+            with gcs_client.bucket(self.gcs_bucket_id).blob(path).open('w') as out_file:
                 out_file.write(schema_json)
 
         # Otherwise write to local directory
         else:
+
             os.makedirs(self.schema_dir, exist_ok=True)
             with open(path, 'w') as out_file:
                 out_file.write(schema_json)
@@ -379,57 +418,34 @@ class IngestionWizard:
         print('Finished formatting the timestamp values')
 
 
-    def _schema_dict_to_bq(self, schema: RecursiveDict) -> List[bigquery.SchemaField]:
-        """Private class method to cast a Python-native schema dictionary
-        as a list of BigQuery SchemaField objects that can be passed to the
-        table directly."""
+    def _init_table(self) -> None:
+        """Private class method to fetch the target table's metadata from
+        BigQuery and in doing so also establish whether the table already exists
+        (no dedicated method in SDK to check existence of table)."""
 
-        return [bigquery.SchemaField(
-            name=name,
-            field_type=value['type'],
-            mode=value['mode'],
-            # Recursive implementation to handle nested fields correctly
-            fields=self._schema_dict_to_bq(value.get('fields'))
-        ) for name, value in schema.items()] if schema else None
+        if not self.disable_bq:
 
+            bq_client = bigquery.Client(self.gcp_project_id)
 
-    def _schema_bq_to_dict(self, schema: List[bigquery.SchemaField]) -> RecursiveDict:
-        """Private class method to cast a list of BigQuery SchemaField
-        objects to a Python-native schema dictionary so that it can be
-        worked with easier."""
+            # Assemble the full table path / id
+            self.full_table_id = f'{self.gcp_project_id}.{self.bq_dataset_id}.{self.bq_table_id}'
 
-        return {field.name: {
-            'type': field.field_type,
-            'mode': field.mode,
-            # Recursive implementation to handle nested fields correctly
-            'fields': self._schema_bq_to_dict(field.fields)
-        } for field in schema} if schema else None
+            # Try pulling the metadata of the table
+            try:
+                self.table = bq_client.get_table(self.full_table_id)
+                print('Target table found in BigQuery')
+                # Save the existing table schema in a class variable
+                self.schema_bq = schema_bq_to_dict(self.table.schema)
 
-
-    def _merge_schemas(self, schema_data: RecursiveDict, schema_bq: RecursiveDict) -> RecursiveDict:
-        """Private class method to merge two Python-native schema dictionaries.
-        schema_data is the detected schema of the data, schema_bq is the schema
-        of the existing table. The existing schema is extended with new fields,
-        existing fields are not touched. The recursive implementation ensures
-        that the schemas of nested fields are also merged properly."""
-
-        # The merge operation of leaf nodes is just a dictionary union
-        merged: RecursiveDict = schema_data | schema_bq
-
-        # Check for any nested fields in the data schema as these need recursion
-        for field, config in schema_data.items():
-            # When a nested field is encountered, go one level deeper in the recursion
-            if config.get('fields') and schema_bq.get(field):
-                merged[field]['fields'] = self._merge_schemas(config['fields'], schema_bq[field]['fields'])
-
-        return merged
+            except NotFound:
+                print('Target table not yet found in BigQuery')
 
 
     def _merge_schemas_wrapper(self) -> None:
         """Private class method to merge two Python-native schema dictionaries.
         This is a wrapper for the recursive _merge_schemas method."""
 
-        self.schema_merged = self._merge_schemas(self.schema_data, self.schema_bq)
+        self.schema_merged = merge_schemas(self.schema_bq, self.schema_data)
 
         # Write the merged schema to disk in case it needs to be checked
         self._schema_writer_wrapper(self.schema_merged, 'merged_schema.json')
@@ -439,7 +455,9 @@ class IngestionWizard:
         """Private class method to create the target BigQuery table based on the
         schema of the data"""
 
-        self.bq_client.create_table(bigquery.Table(self.full_table_id, self._schema_dict_to_bq(self.schema_data)))
+        bq_client = bigquery.Client(self.gcp_project_id)
+
+        bq_client.create_table(bigquery.Table(self.full_table_id, schema_dict_to_bq(self.schema_data)))
 
         print('Target table has been created at {}'.format(self.full_table_id))
 
@@ -449,10 +467,13 @@ class IngestionWizard:
         based on the schema that resulted from extending the existing schema with
         new fields encountered in the data."""
 
+        bq_client = bigquery.Client(self.gcp_project_id)
+
         if self.schema_data != self.schema_bq:
+
             self._merge_schemas_wrapper()
-            self.table.schema = self._schema_dict_to_bq(self.schema_merged)
-            self.bq_client.update_table(self.table, ['schema'])
+            self.table.schema = schema_dict_to_bq(self.schema_merged)
+            bq_client.update_table(self.table, ['schema'])
             print('Schema of target table has been extended')
 
         else: print('Schemas of data and target table already match')
@@ -474,11 +495,13 @@ class IngestionWizard:
 
         if not self.disable_bq:
 
+            bq_client = bigquery.Client(self.gcp_project_id)
+
             for file in self.data:
                 # No error is raised when it is the insertion of individual rows
                 # that fails, not the BQ job as a whole. The errors are accumulated
                 # in a list, and we raise an error manually if it is not empty.
-                errors = self.bq_client.insert_rows_json(self.full_table_id, file)
+                errors = bq_client.insert_rows_json(self.full_table_id, file)
                 if errors: raise Exception('Error(s) occurred while inserting rows:\n{}'.format(errors))
 
             print('Finished streaming data to target table')
@@ -491,11 +514,17 @@ class IngestionWizard:
         if self.disable_gcs: print('Skipping all GCS interactions; using local data.')
         if self.disable_bq: print('Skipping all BQ operations.')
 
-        self._init_clients()
+        # Initialise ray in preparation for multiprocessing
+        ray.init(num_cpus=4)
+
         self._fetch_data()
-        self._init_table()
         self._infer_schema_wrapper()
         self._ts_format_wrapper()
+
+        # Ray no longer needed
+        ray.shutdown()
+
+        self._init_table()
         self._create_or_extend_table()
         self._stream_data_to_table()
 

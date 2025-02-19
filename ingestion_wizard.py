@@ -181,14 +181,17 @@ class IngestionWizard:
         if not files: raise FileNotFoundError('No JSON files found in GCS')
 
         # Read the GCS data that simulates the output of an ingestion run
+        data = []
         for file in files:
             with file.open('r') as in_file:
                 # Keep the files separated in the list to avoid accidentally
                 # creating 10Mb+ imports that BQ might complain about
-                self.data += [[json.loads(record) for record in in_file]]
+                data += [[json.loads(record) for record in in_file]]
 
         # Throw an exception if the JSON files yielded no data
-        if not self.data: raise Exception('None of the JSON files yielded any data')
+        if not data: raise Exception('None of the JSON files yielded any data')
+
+        self.data = data
 
         print('Finished fetching JSON data from GCS')
 
@@ -205,14 +208,17 @@ class IngestionWizard:
         if not files: raise FileNotFoundError('No JSON files found in the local directory')
 
         # Read the local data that simulates the output of an ingestion run
+        data = []
         for file in os.listdir(self.data_dir):
             with open(f'{self.data_dir}/{file}') as in_file:
                 # Keep the files separated in the list to avoid accidentally
                 # creating 10Mb+ imports that BQ might complain about
-                self.data += [[json.loads(record) for record in in_file]]
+                data += [[json.loads(record) for record in in_file]]
 
         # Throw an exception if the JSON files yielded no data
-        if not self.data: raise Exception('None of the JSON files yielded any data')
+        if not data: raise Exception('None of the JSON files yielded any data')
+
+        self.data = data
 
         print('Finished fetching JSON data from local directory')
 

@@ -487,9 +487,9 @@ class IngestionWizard:
 
         self._init_clients()
         self._fetch_data()
-        self._init_table()
         self._infer_schema_wrapper()
         self._ts_format_wrapper()
+        self._init_table()
         self._create_or_extend_table()
         self._stream_data_to_table()
 
